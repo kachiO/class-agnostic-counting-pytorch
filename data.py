@@ -2,9 +2,9 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from scipy.ndimage import gaussian_filter, affine_transform
 from PIL import Image
 from torchvision.transforms import Normalize, RandomAffine, RandomHorizontalFlip, CenterCrop, ToTensor, Compose
-import numpy as np, torch
+import numpy as np, torch, json
 from pathlib import Path
-
+from utils import reorganize_annotations_by_filename
 
 IMAGENET_VID_DIMS = dict(
     image = (255, 255, 3),
@@ -17,7 +17,7 @@ DATA_MAP = {'a': 'ILSVRC2015_VID_train_0000',
             'd': 'ILSVRC2015_VID_train_0003',
             'e': 'val'}
 
-DATA_ROOT = '/home/odoemoo1/data/mldata/Imagenet_Video_2015/ILSVRC2015/crop_255_exemplar_63_context_0.1/'
+DATA_ROOT = './dataset/Imagenet_Video_2015/ILSVRC2015/crop_255_exemplar_63_context_0.1/'
 
 IMAGENET_STATS = dict(mean = (0.485, 0.456, 0.406),
                       std = (0.229, 0.224, 0.225))
@@ -146,3 +146,68 @@ class ValidSampler(Sampler):
     
     def __iter__(self):
         return iter(self._inds)
+    
+DATA_DIR = './dataset/iSAID/Processed/Patches/patch_W800_patch_H800_overlap200/train/'
+ANNOT_FILE = 'instancesonly_filtered_train.json'
+
+class DOTADataset(Dataset):
+    def __init__(self, data_dir=None, annots_file=None, transform=False):
+        self.data_dir = DATA_DIR if data_dir is None else data_dir
+        self.annots = Path(DATA_DIR) / ANNOT_FILE if annots_file is None else annots_file
+        self.transform = transform
+        
+        if self.transform:
+            self.tfms = tfms.Compose([tfms.ToTensor(), tfms.Normalize(**IMAGENET_STATS)])
+            
+        with open(self.annots, 'r') as f:
+            self.file = json.load(f)
+        
+        self.annotations_by_filename = reorganize_annotations_by_filename(self.file)
+
+    def __len__(self):
+        return len(self.file['images'])
+    
+    def _getdata(self, index):
+        fn = self.file['images'][index]['file_name']
+        annotations = self.annotations_by_filename[fn]
+        
+        if not len(annotations):
+            return self._getdata(np.random.choice(len(self)))
+        
+        return fn, annotations
+            
+    def __getitem__(self, index):
+        self.fn, self.annotations = self._getdata(index)
+        
+        image = Image.open(Path(self.data_dir) / 'images'/ self.fn)    
+        cat_ids = {a['category_id']: a['category_name'] for a in self.annotations}
+        
+        # select patch
+        a_ind = np.random.choice(self.annotations)
+        x, y, w, h = a_ind['bbox']
+        context  = (w + h ) * 0.1
+        bbox = [max(x - context, 0), max(y - context, 0), min(x + w + context, 800), min(y + h + context, 800)]
+        patch = image.crop(bbox).resize((63, 63))
+        patch_cat = a_ind['category_name']
+        
+        if self.transform:
+            patch = self.tfms(patch)
+            image = self.tfms(image)
+            
+        centers = [((2 * a['bbox'][1] + a['bbox'][3]) // 2, (2 * a['bbox'][0] + a['bbox'][2]) // 2) 
+                        for a in self.annotations if a['category_name'] == a_ind['category_name']]
+
+        centers = torch.tensor(centers, dtype=torch.long)
+        dot_annot = torch.zeros((800, 800), dtype=torch.float)
+
+        for coord in centers: 
+            dot_annot[coord[0], coord[1]] = 1.
+            
+        dot_annot_blob = 100 * gaussian_filter(dot_annot.numpy(), sigma=(4, 4), mode='constant')
+        
+        output = {'image': image, 
+                  'patch': patch, 
+                  'gt': torch.tensor(dot_annot_blob, dtype=torch.float),
+                  'patch_category': patch_cat}
+    
+        return output
